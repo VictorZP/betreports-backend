@@ -1,3 +1,4 @@
+# app/services/notion_sync.py
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -5,141 +6,109 @@ from notion_client import Client
 from sqlalchemy.orm import Session
 from app.models.bet import Bet
 from dotenv import load_dotenv
-from .notion_service import NotionService
 
 load_dotenv()
 
 class NotionSync:
-    
-    def __init__(self, season='2024-2025'):
-        """Инициализация с выбранным сезоном"""
+    def __init__(self, season: Optional[str] = None):
+        """Инициализация с выбранным сезоном и стабильным маппингом env-переменных."""
+        # Нормализуем сезон (по умолчанию берем из DEFAULT_SEASON, иначе '2024')
+        season = (season or os.getenv("DEFAULT_SEASON") or "2024").strip()
         self.season = season
-        
-        # Выбираем токен и базу в зависимости от сезона
-        if season == '2024-2025':
-            token = os.getenv('NOTION_TOKEN_2024') or os.getenv('NOTION_TOKEN')
-            database_id = os.getenv('NOTION_DATABASE_2024') or os.getenv('NOTION_DATABASE_ID')
-        elif season == '2025-2026':
-            token = os.getenv('NOTION_TOKEN_2025')
-            database_id = os.getenv('NOTION_DATABASE_2025')
-        else:
-            token = os.getenv('NOTION_TOKEN_2024') or os.getenv('NOTION_TOKEN')
-            database_id = os.getenv('NOTION_DATABASE_2024') or os.getenv('NOTION_DATABASE_ID')
-        
+
+        # Явный маппинг сезонов → пар переменных
+        # Добавь сюда новые сезоны по мере необходимости
+        mapping = {
+            "2024":       ("NOTION_TOKEN_2024", "NOTION_DATABASE_2024"),
+            "2024-2025":  ("NOTION_TOKEN_2024", "NOTION_DATABASE_2024"),
+            "2025":       ("NOTION_TOKEN_2025", "NOTION_DATABASE_2025"),
+            "2025-2026":  ("NOTION_TOKEN_2025", "NOTION_DATABASE_2025"),
+        }
+
+        token_key, db_key = mapping.get(season, ("NOTION_TOKEN_2024", "NOTION_DATABASE_2024"))
+
+        token = os.getenv(token_key) or os.getenv("NOTION_TOKEN")
+        database_id = os.getenv(db_key) or os.getenv("NOTION_DATABASE_ID")
+
         if not token or not database_id:
-            print(f"WARNING: Missing credentials for season {season}")
-        
+            print(f"WARNING: Missing Notion credentials for season '{season}' "
+                  f"(checked {token_key}/{db_key} and NOTION_TOKEN/NOTION_DATABASE_ID)")
+
         self.notion = Client(auth=token)
         self.database_id = database_id
 
-    def parse_notion_text(self, prop):
-        """Парсинг текстовых полей из Notion"""
+    # ==== Хелперы парсинга свойств Notion ====
+
+    def _parse_text(self, prop):
         if not prop:
             return None
-        
-        if prop['type'] == 'title':
-            if prop['title']:
-                return prop['title'][0]['plain_text']
-        elif prop['type'] == 'rich_text':
-            if prop['rich_text']:
-                text_parts = []
-                for item in prop['rich_text']:
-                    if 'plain_text' in item:
-                        text_parts.append(item['plain_text'])
-                return ''.join(text_parts) if text_parts else None
-        elif prop['type'] == 'select':
-            if prop['select']:
-                return prop['select']['name']
-        
+        t = prop.get("type")
+        if t == "title" and prop.get("title"):
+            return prop["title"][0].get("plain_text")
+        if t == "rich_text" and prop.get("rich_text"):
+            return "".join(x.get("plain_text", "") for x in prop["rich_text"])
+        if t == "select" and prop.get("select"):
+            return prop["select"].get("name")
         return None
 
-    def parse_notion_formula(self, prop):
-        """Парсинг полей-формул из Notion"""
-        if not prop or prop['type'] != 'formula':
-            return None
-        
-        formula = prop.get('formula', {})
-        
-        if formula.get('type') == 'string':
-            return formula.get('string')
-        elif formula.get('type') == 'number':
-            return formula.get('number')
-        elif formula.get('type') == 'boolean':
-            return formula.get('boolean')
-        
-        return None
-
-    def parse_notion_number(self, prop):
-        """Парсинг числовых полей из Notion"""
+    def _parse_number(self, prop):
         if not prop:
             return None
-        
-        if prop['type'] == 'number':
-            return prop.get('number')
-        elif prop['type'] == 'formula':
-            formula = prop.get('formula')
-            if formula and formula['type'] == 'number':
-                return formula.get('number')
-        
+        t = prop.get("type")
+        if t == "number":
+            return prop.get("number")
+        if t == "formula":
+            f = prop.get("formula") or {}
+            if f.get("type") == "number":
+                return f.get("number")
         return None
 
-    def parse_notion_date(self, prop):
-        """Парсинг даты из Notion"""
+    def _parse_formula(self, prop):
+        if not prop or prop.get("type") != "formula":
+            return None
+        f = prop.get("formula") or {}
+        if f.get("type") == "string":
+            return f.get("string")
+        if f.get("type") == "number":
+            return f.get("number")
+        if f.get("type") == "boolean":
+            return f.get("boolean")
+        return None
+
+    def _parse_date(self, prop):
         if not prop:
             return None
-        
-        if prop['type'] == 'date' and prop['date']:
-            date_str = prop['date']['start']
-            try:
-                return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            except:
+        if prop.get("type") == "date" and prop.get("date"):
+            s = prop["date"].get("start")
+            if not s:
                 return None
-        
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
         return None
 
-    def parse_notion_checkbox(self, prop):
-        """Парсинг чекбоксов из Notion"""
+    def _parse_checkbox(self, prop) -> bool:
         if not prop:
             return False
-        
-        if prop['type'] == 'checkbox':
-            return prop.get('checkbox', False)
-        
+        if prop.get("type") == "checkbox":
+            return prop.get("checkbox", False)
         return False
 
-    def parse_screenshot_url(self, prop):
-        """Парсинг URL скриншота из Notion"""
+    def _parse_url_or_text_url(self, prop):
         if not prop:
             return None
-        
-        if prop['type'] == 'url':
-            return prop.get('url')
-        elif prop['type'] == 'rich_text' and prop['rich_text']:
-            return prop['rich_text'][0].get('plain_text')
-        
+        t = prop.get("type")
+        if t == "url":
+            return prop.get("url")
+        if t == "rich_text" and prop.get("rich_text"):
+            return prop["rich_text"][0].get("plain_text")
         return None
 
-    def parse_notion_formula(self, prop):
-        """Парсинг полей-формул из Notion"""
-        if not prop or prop['type'] != 'formula':
-            return None
-        
-        formula = prop.get('formula', {})
-        
-        # Если формула возвращает строку
-        if formula.get('type') == 'string':
-            return formula.get('string')
-        # Если формула возвращает число
-        elif formula.get('type') == 'number':
-            return formula.get('number')
-        # Если формула возвращает boolean
-        elif formula.get('type') == 'boolean':
-            return formula.get('boolean')
-        
-        return None
+    # ==== Основной синк ====
 
     def sync_with_notion(self, db: Session) -> Dict[str, Any]:
-        """Синхронизация данных из Notion в базу данных"""
+        """Синхронизация данных из Notion в базу данных."""
         try:
             if not self.database_id:
                 return {
@@ -147,68 +116,56 @@ class NotionSync:
                     "message": f"База данных для сезона {self.season} не настроена",
                     "stats": None
                 }
-            
-            print(f"Fetching data from Notion for season {self.season}...")
-            
-            response = self.notion.databases.query(
-                database_id=self.database_id,
-                page_size=100
-            )
-            
-            results = response["results"]
-            
+
+            print(f"[sync] Fetching data from Notion for season '{self.season}'...")
+            response = self.notion.databases.query(database_id=self.database_id, page_size=100)
+            results = list(response.get("results", []))
+
             while response.get("has_more"):
                 response = self.notion.databases.query(
                     database_id=self.database_id,
-                    start_cursor=response["next_cursor"],
+                    start_cursor=response.get("next_cursor"),
                     page_size=100
                 )
-                results.extend(response["results"])
-            
-            print(f"Found {len(results)} records in Notion")
-            
-            stats = {
-                "total": len(results),
-                "created": 0,
-                "updated": 0,
-                "errors": 0,
-                "wins": 0,
-                "losses": 0,
-                "no_result": 0
-            }
-            
+                results.extend(response.get("results", []))
+
+            print(f"[sync] Found {len(results)} records in Notion")
+
+            stats = {"total": len(results), "created": 0, "updated": 0, "errors": 0,
+                     "wins": 0, "losses": 0, "no_result": 0}
+
             for row in results:
                 try:
-                    properties = row["properties"]
-                    
-                    notion_id = row["id"]
-                    date = self.parse_notion_date(properties.get("Date"))
-                    tournament = self.parse_notion_text(properties.get("Турнир"))
-                    
-                    team1 = self.parse_notion_text(properties.get("Команда 1"))
-                    team2 = self.parse_notion_text(properties.get("Команда 2"))
+                    p = row.get("properties", {})
+                    notion_id = row.get("id")
+
+                    date = self._parse_date(p.get("Date"))
+                    tournament = self._parse_text(p.get("Турнир"))
+
+                    team1 = self._parse_text(p.get("Команда 1"))
+                    team2 = self._parse_text(p.get("Команда 2"))
                     match = f"{team1} vs {team2}" if team1 and team2 else None
-                    
-                    bet_type = self.parse_notion_text(properties.get("Ставка"))
-                    total_value = self.parse_notion_number(properties.get("Значение тотала"))
-                    score = self.parse_notion_text(properties.get("Итог"))
-                    
-                    # Парсим результат (формула с эмодзи)
-                    result_prop = properties.get("Результат")
+
+                    bet_type = self._parse_text(p.get("Ставка"))
+                    total_value = self._parse_number(p.get("Значение тотала"))
+                    score = self._parse_text(p.get("Итог"))
+
+                    # Результат (формула/текст с эмодзи)
+                    result_prop = p.get("Результат")
                     result_text = None
                     won = None
-                    
-                    if result_prop and result_prop['type'] == 'formula':
-                        result_text = self.parse_notion_formula(result_prop)
+
+                    if result_prop and result_prop.get("type") == "formula":
+                        result_text = self._parse_formula(result_prop)
                     elif result_prop:
-                        result_text = self.parse_notion_text(result_prop)
-                    
+                        result_text = self._parse_text(result_prop)
+
                     if result_text:
-                        if '✅' in result_text:
+                        if "✅" in result_text:
                             won = True
                             result_text = "WIN"
                             stats["wins"] += 1
-                        elif '❌' in result_text:
+                        elif "❌" in result_text:
                             won = False
                             result_text = "LOSE"
                             stats["losses"] += 1
@@ -220,69 +177,53 @@ class NotionSync:
                         won = None
                         result_text = "-"
                         stats["no_result"] += 1
-                    
-                    # Коэффициент
+
+                    # Коэф/ставка/профит (дефолты)
                     coefficient = 1.85
-                    
-                    # Парсим профит (тоже формула)
-                    profit_prop = properties.get("Потенциальный профит")
-                    profit = None
-                    
-                    if profit_prop and profit_prop['type'] == 'formula':
-                        profit = self.parse_notion_formula(profit_prop)
-                    elif profit_prop:
-                        profit = self.parse_notion_number(profit_prop)
-                    
-                    # Базовая ставка
                     stake = 100.0
-                    
-                    # Если профита нет, вычисляем
+                    profit_prop = p.get("Потенциальный профит")
+                    profit = None
+                    if profit_prop and profit_prop.get("type") == "formula":
+                        profit = self._parse_formula(profit_prop)
+                    elif profit_prop:
+                        profit = self._parse_number(profit_prop)
                     if profit is None and won is not None:
-                        if won:
-                            profit = stake * 0.85
-                        else:
-                            profit = -stake
-                    
-                    # Парсим остальные поля
-                    is_premium = self.parse_notion_checkbox(properties.get("Премиум"))
-                    time_str = self.parse_notion_text(properties.get("Время ставки"))
-                    
-                    screenshot_url = None
-                    if "Скрин из бота" in properties:
-                        screenshot_url = self.parse_screenshot_url(properties["Скрин из бота"])
-                    
+                        profit = stake * 0.85 if won else -stake
+
+                    is_premium = self._parse_checkbox(p.get("Премиум"))
+                    time_str = self._parse_text(p.get("Время ставки"))
+                    screenshot_url = self._parse_url_or_text_url(p.get("Скрин из бота"))
+
                     match_url = None
-                    if 'Ссылка на матч' in properties:
-                        url_prop = properties['Ссылка на матч']
-                        if url_prop.get('type') == 'url' and url_prop.get('url'):
-                            match_url = url_prop['url']
-                    
-                    # Сохраняем в БД
-                    existing_bet = db.query(Bet).filter(Bet.notion_id == notion_id).first()
-                    
-                    if existing_bet:
-                        print(f"Updating existing bet {notion_id}")
-                        existing_bet.date = date
-                        existing_bet.tournament = tournament
-                        existing_bet.match = match
-                        existing_bet.bet_type = bet_type
-                        existing_bet.coefficient = coefficient
-                        existing_bet.total_value = total_value
-                        existing_bet.score = score
-                        existing_bet.result = result_text
-                        existing_bet.won = won
-                        existing_bet.stake = stake
-                        existing_bet.profit = profit or 0
-                        existing_bet.is_premium = is_premium
-                        existing_bet.screenshot_url = screenshot_url
-                        existing_bet.match_url = match_url
-                        existing_bet.time = time_str
-                        existing_bet.season = self.season
-                        existing_bet.updated_at = datetime.utcnow()
+                    if "Ссылка на матч" in p:
+                        prop_url = p["Ссылка на матч"]
+                        if prop_url.get("type") == "url" and prop_url.get("url"):
+                            match_url = prop_url["url"]
+
+                    existing = db.query(Bet).filter(Bet.notion_id == notion_id).first()
+                    if existing:
+                        # update
+                        existing.date = date
+                        existing.tournament = tournament
+                        existing.match = match
+                        existing.bet_type = bet_type
+                        existing.coefficient = coefficient
+                        existing.total_value = total_value
+                        existing.score = score
+                        existing.result = result_text
+                        existing.won = won
+                        existing.stake = stake
+                        existing.profit = profit or 0
+                        existing.is_premium = is_premium
+                        existing.screenshot_url = screenshot_url
+                        existing.match_url = match_url
+                        existing.time = time_str
+                        existing.season = self.season
+                        existing.updated_at = datetime.utcnow()
                         stats["updated"] += 1
                     else:
-                        print(f"Creating new bet {notion_id}")
-                        new_bet = Bet(
+                        # create
+                        db.add(Bet(
                             notion_id=notion_id,
                             date=date,
                             tournament=tournament,
@@ -301,38 +242,23 @@ class NotionSync:
                             time=time_str,
                             season=self.season,
                             created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow()
-                        )
-                        db.add(new_bet)
+                            updated_at=datetime.utcnow(),
+                        ))
                         stats["created"] += 1
-                    
+
                 except Exception as e:
-                    print(f"Error processing row {row.get('id')}: {e}")
+                    print(f"[sync] Error processing row {row.get('id')}: {e}")
                     stats["errors"] += 1
                     continue
-            
+
             db.commit()
-            
-            print(f"\nSync completed:")
-            print(f"  Created: {stats['created']}")
-            print(f"  Updated: {stats['updated']}")
-            print(f"  Wins: {stats['wins']}")
-            print(f"  Losses: {stats['losses']}")
-            print(f"  No result: {stats['no_result']}")
-            
-            return {
-                "success": True,
-                "message": f"Синхронизация завершена успешно",
-                "stats": stats
-            }
-            
+            print(f"[sync] Done. Created={stats['created']} Updated={stats['updated']} "
+                  f"Wins={stats['wins']} Losses={stats['losses']} NoRes={stats['no_result']}")
+
+            return {"success": True, "message": "Синхронизация завершена успешно", "stats": stats}
+
         except Exception as e:
-            print(f"Sync error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[sync] Fatal error: {e}")
+            import traceback; traceback.print_exc()
             db.rollback()
-            return {
-                "success": False,
-                "message": f"Ошибка синхронизации: {str(e)}",
-                "stats": None
-            }
+            return {"success": False, "message": f"Ошибка синхронизации: {e}", "stats": None}
