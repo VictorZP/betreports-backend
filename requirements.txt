@@ -7,3 +7,5 @@ sqlalchemy
 psycopg2-binary
 notion-client
 pytz
+httpx
+beautifulsoup4
