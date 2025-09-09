@@ -4,7 +4,7 @@ from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import Optional
-import os
+import os, logging
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -21,7 +21,11 @@ load_dotenv()
 # создаём таблицы при старте (на нужной БД)
 Base.metadata.create_all(bind=engine)
 
+logging.getLogger("uvicorn").info(f"PORT env = {os.getenv('PORT')}")
+
 app = FastAPI(title="BetReports API")
+
+
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2024")
@@ -42,11 +46,7 @@ def health_db():
 # ===== CORS =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "https://frontend-production-0d68.up.railway.app",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
