@@ -270,7 +270,10 @@ def get_stats(
     calculator = ProfitCalculator()
     profit = calculator.calculate_total_profit(bets)
 
-    win_rate = (profit["total_wins"] / total_bets * 100) if total_bets > 0 else 0
+    wins = sum(1 for b in bets if b.won is True)
+    losses = sum(1 for b in bets if b.won is False)
+    no_result = max(0, total_bets - wins - losses)
+    win_rate = (wins / total_bets * 100) if total_bets > 0 else 0
     roi = (profit["total_profit"] / profit["total_staked"] * 100) if profit["total_staked"] > 0 else 0
 
     # не показываем периоды в будущем (только до текущей даты включительно)
@@ -292,8 +295,8 @@ def get_stats(
         "totalStaked": round(profit["total_staked"], 2),
         "totalWon": round(profit["total_won"], 2),
         "roi": round(roi, 1),
-        "wins": profit["total_wins"],
-        "losses": profit["total_losses"],
+        "wins": int(wins),          # <-- берём из Bet.won
+        "losses": int(losses),      # <-- берём из Bet.won
         "currentNominal": profit["current_nominal"],
         "currentBank": profit["current_bank"],
         "periods": periods
