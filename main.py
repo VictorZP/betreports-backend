@@ -9,7 +9,7 @@ from calendar import monthrange
 
 
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import text, func, case
 
 from app.database.database import engine, SessionLocal, Base as DBBase, get_db
 from app.models.bet import Base, Bet  # используем Base из моделей для create_all
@@ -440,7 +440,44 @@ async def get_screenshot_proxy(url: str):
         print(f"Error fetching screenshot: {e}")
         return {"image_url": None}
 
+@app.get("/api/debug/result-breakdown")
+def debug_result_breakdown(
+    season: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(
+        func.count(Bet.id).label("total"),
+        func.sum(case((Bet.won == True, 1), else_=0)).label("wins"),
+        func.sum(case((Bet.won == False, 1), else_=0)).label("losses"),
+        func.sum(case((Bet.won == None, 1), else_=0)).label("unknown"),
+        func.sum(case((Bet.notion_id == None, 1), else_=0)).label("no_notion_id"),
+    )
 
+    # фильтр по сезону (август-главная логика; при необходимости подстроим)
+    if season:
+        y1, y2 = [int(x) for x in season.split("-")]
+        start = datetime(y1, 8, 1)
+        end = datetime(y2, 7, 31, 23, 59, 59)
+        q = q.filter(Bet.date >= start, Bet.date <= end)
+
+    row = q.one()
+    # сколько дублей notion_id
+    dupes = (
+        db.query(Bet.notion_id, func.count(Bet.id).label("cnt"))
+        .filter(Bet.notion_id != None)
+        .group_by(Bet.notion_id)
+        .having(func.count(Bet.id) > 1)
+        .limit(10)
+        .all()
+    )
+    return {
+        "total": int(row.total or 0),
+        "wins": int(row.wins or 0),
+        "losses": int(row.losses or 0),
+        "unknown": int(row.unknown or 0),
+        "no_notion_id": int(row.no_notion_id or 0),
+        "dupe_notion_ids_sample": [{"notion_id": d[0], "count": int(d[1])} for d in dupes],
+    }
 # ===== локальный запуск =====
 if __name__ == "__main__":
     import uvicorn
