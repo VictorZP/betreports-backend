@@ -163,8 +163,11 @@ def get_stats(
     db: Session = Depends(get_db)
 ):
     """
-    Статистика по новой логике (ProfitCalculator) + периоды (nominal/bank на каждый период).
-    Month и date-range пересекаем; при конфликте возвращаем filterConflict=true.
+    Статистика по НОВОЙ логике:
+    - Шкала bank/nominal строится на всём сезоне (season).
+    - Метрики по фильтрам считаются с учётом сезонного nominal каждого периода.
+    - Таблица периодов показывает bank/nominal из сезонной шкалы, а W/L/профит — по текущим фильтрам.
+    - Будущие периоды не показываем. Конфликт month vs date-range => filterConflict=True.
     """
     # ---------- 1) пересечение month и date-range ----------
     eff_start = None
@@ -202,7 +205,7 @@ def get_stats(
                 "periods": []
             }
 
-    # ---------- 2) базовый запрос + фильтры ----------
+    # ---------- 2) базовый запрос + фильтры на ставки ----------
     query = db.query(Bet)
 
     if season:
@@ -251,6 +254,7 @@ def get_stats(
 
     total_bets = len(bets)
     if total_bets == 0:
+        # ранний выход — как было
         return {
             "filterConflict": False,
             "totalBets": 0,
@@ -266,39 +270,102 @@ def get_stats(
             "periods": []
         }
 
-    # ---------- 3) расчёты новой логикой ----------
-    calculator = ProfitCalculator()
-    profit = calculator.calculate_total_profit(bets)
+    # ---------- 3) сезонная шкала bank/nominal на всём сезоне ----------
+    season_q = db.query(Bet)
+    if season:
+        season_q = season_q.filter(Bet.season == season)
+    season_bets_all = season_q.order_by(Bet.date.asc()).all()
 
-    wins = sum(1 for b in bets if b.won is True)
-    losses = sum(1 for b in bets if b.won is False)
-    no_result = max(0, total_bets - wins - losses)
-    win_rate = (wins / total_bets * 100) if total_bets > 0 else 0
-    roi = (profit["total_profit"] / profit["total_staked"] * 100) if profit["total_staked"] > 0 else 0
+    season_calc = ProfitCalculator()
+    season_profit = season_calc.calculate_total_profit(season_bets_all)
+    season_periods = season_profit.get("periods", [])
 
-    # не показываем периоды в будущем (только до текущей даты включительно)
+    def period_for_date(dt):
+        if not dt:
+            return None
+        for p in season_periods:
+            ps = datetime.strptime(p["start"], "%Y-%m-%d")
+            pe = datetime.strptime(p["end"], "%Y-%m-%d")
+            if ps <= dt <= pe:
+                return p
+        return None
+
+    # ---------- 4) метрики по ОТФИЛЬТРОВАННЫМ ставкам, но ставки = сезонный nominal ----------
+    wins = 0
+    losses = 0
+    total_profit_money = 0.0
+    total_staked = 0.0
+    total_won = 0.0
+
+    for b in bets:
+        p = period_for_date(b.date)
+        stake = (p["nominal"] if p else 100)  # если не нашли период — по умолчанию 100
+        total_staked += stake
+
+        if b.won is True:
+            wins += 1
+            win_amount = stake * 0.85
+            total_profit_money += win_amount
+            total_won += stake + win_amount
+        elif b.won is False:
+            losses += 1
+            total_profit_money -= stake
+        else:
+            pass  # неизвестный результат не учитываем в W/L
+
+    win_rate = (wins / total_bets * 100) if total_bets > 0 else 0.0
+    roi = (total_profit_money / total_staked * 100) if total_staked > 0 else 0.0
+
+    # ---------- 5) таблица периодов для UI: bank/nominal — из сезонной шкалы; W/L/профит — по filters ----------
     now = datetime.now()
     periods = []
-    for p in profit.get("periods", []):
-        try:
-            pend = datetime.strptime(p["end"], "%Y-%m-%d")
-        except Exception:
+    for p in season_periods:
+        ps = datetime.strptime(p["start"], "%Y-%m-%d")
+        pe = datetime.strptime(p["end"], "%Y-%m-%d")
+        if pe > now:
+            break  # будущие периоды не показываем
+
+        # пересечение с eff_start/eff_end (если заданы)
+        if eff_start and pe < eff_start:
             continue
-        if pend <= now:
-            periods.append(p)
+        if eff_end and ps > eff_end:
+            continue
+
+        bets_in_period = [b for b in bets if b.date and ps <= b.date <= pe]
+        stake_per = p["nominal"]
+
+        wins_p = sum(1 for b in bets_in_period if b.won is True)
+        losses_p = sum(1 for b in bets_in_period if b.won is False)
+        profit_p = wins_p * stake_per * 0.85 - losses_p * stake_per
+        staked_p = len(bets_in_period) * stake_per
+
+        periods.append({
+            "start": p["start"],
+            "end": p["end"],
+            "month": p["month"],
+            "bets": len(bets_in_period),
+            "wins": wins_p,
+            "losses": losses_p,
+            "profit": round(profit_p, 2),
+            "staked": round(staked_p, 2),
+            "nominal": p["nominal"],  # из сезонной шкалы
+            "bank": p["bank"],        # из сезонной шкалы
+            "win_rate": round((wins_p / len(bets_in_period) * 100), 1) if bets_in_period else 0
+        })
 
     return {
         "filterConflict": False,
         "totalBets": total_bets,
         "winRate": round(win_rate, 1),
-        "totalProfit": round(profit["total_profit"], 2),
-        "totalStaked": round(profit["total_staked"], 2),
-        "totalWon": round(profit["total_won"], 2),
+        "totalProfit": round(total_profit_money, 2),
+        "totalStaked": round(total_staked, 2),
+        "totalWon": round(total_won, 2),
         "roi": round(roi, 1),
-        "wins": int(wins),          # <-- берём из Bet.won
-        "losses": int(losses),      # <-- берём из Bet.won
-        "currentNominal": profit["current_nominal"],
-        "currentBank": profit["current_bank"],
+        "wins": int(wins),
+        "losses": int(losses),
+        # глобальные (фиксированные) значения из сезонной шкалы
+        "currentNominal": season_profit.get("current_nominal", 100),
+        "currentBank": season_profit.get("current_bank", 2000),
         "periods": periods
     }
 
