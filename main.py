@@ -151,45 +151,42 @@ def get_stats(
     end_date: Optional[str] = None,     # 'YYYY-MM-DD'
     start_time: Optional[str] = None,   # 'HH:MM'
     end_time: Optional[str] = None,     # 'HH:MM'
+
     # фильтры
-    bet_type: Optional[str] = None,     # 'all' или подстрока
+    bet_type: Optional[str] = None,
     is_premium: Optional[bool] = None,
     result: Optional[str] = None,       # 'WIN' | 'LOSE' | 'all'
     month: Optional[str] = None,        # 'YYYY-MM'
-    season: Optional[str] = None,       # '2024-2025'
+    season: Optional[str] = None,
     tournaments: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
+
+    db: Session = Depends(get_db)
 ):
     """
-    Корректная статистика:
-    - Все фильтры (season, month, date range, time-of-day, bet_type contains, is_premium, tournaments).
-    - WIN/LOSE считаем строго по Bet.won (то, что синк заполнил).
-    - Если month и date-range не пересекаются — возвращаем flag filterConflict.
+    Статистика по новой логике (ProfitCalculator) + периоды (nominal/bank на каждый период).
+    Month и date-range пересекаем; при конфликте возвращаем filterConflict=true.
     """
-
-    # ---------- 1) вычисляем пересечение month и date-range ----------
+    # ---------- 1) пересечение month и date-range ----------
     eff_start = None
     eff_end = None
 
-    # период месяца
     m_start = m_end = None
     if month:
         try:
-            y, m = map(int, month.split("-"))
+            y, m = month.split('-')
+            y = int(y); m = int(m)
             m_start = datetime(y, m, 1)
             m_end = datetime(y, m, monthrange(y, m)[1], 23, 59, 59)
         except Exception:
             pass
 
-    # диапазон дат
     d_start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
     d_end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1) - timedelta(seconds=1)) if end_date else None
 
     if m_start or d_start:
-        eff_start = max([x for x in (m_start, d_start) if x], default=None)
-        eff_end   = min([x for x in (m_end, d_end) if x],   default=None)
+        eff_start = max([d for d in [m_start, d_start] if d], default=None)
+        eff_end   = min([d for d in [m_end, d_end] if d],   default=None)
         if eff_start and eff_end and eff_start > eff_end:
-            # конфликт фильтров: месяц не пересекается с диапазоном дат
             return {
                 "filterConflict": True,
                 "totalBets": 0,
@@ -202,35 +199,40 @@ def get_stats(
                 "losses": 0,
                 "currentNominal": 100,
                 "currentBank": 2000,
-                "noResult": 0,
+                "periods": []
             }
 
     # ---------- 2) базовый запрос + фильтры ----------
-    q = db.query(Bet)
+    query = db.query(Bet)
 
-    # сезон: если у тебя в таблице есть колонка Bet.season — фильтруем по ней.
     if season:
-        q = q.filter(Bet.season == season)
+        query = query.filter(Bet.season == season)
 
     if eff_start:
-        q = q.filter(Bet.date >= eff_start)
+        query = query.filter(Bet.date >= eff_start)
     if eff_end:
-        q = q.filter(Bet.date <= eff_end)
+        query = query.filter(Bet.date <= eff_end)
 
-    if bet_type and bet_type != "all":
-        q = q.filter(Bet.bet_type.contains(bet_type))
+    if bet_type and bet_type != 'all':
+        query = query.filter(Bet.bet_type.contains(bet_type))
 
     if is_premium is not None:
-        q = q.filter(Bet.is_premium == is_premium)
+        query = query.filter(Bet.is_premium == is_premium)
 
-    # tournaments (CSV)
+    if result and result != 'all':
+        if result.upper() == 'WIN':
+            query = query.filter(Bet.won == True)
+        elif result.upper() == 'LOSE':
+            query = query.filter(Bet.won == False)
+
     if tournaments:
-        tlist = [t.strip() for t in tournaments.split(",") if t.strip()]
-        if tlist:
-            q = q.filter(Bet.tournament.in_(tlist))
+        t_list = [t.strip() for t in tournaments.split(',') if t.strip()]
+        if t_list:
+            query = query.filter(Bet.tournament.in_(t_list))
 
-    # Временной фильтр по времени суток (дополняет, не отключает остальные)
-    rows = q.all()
+    bets = query.all()
+
+    # фильтр по времени суток
     if start_time or end_time:
         def within_time(b):
             if not b.date:
@@ -245,10 +247,9 @@ def get_stats(
                 if bt > et:
                     return False
             return True
-        rows = [b for b in rows if within_time(b)]
+        bets = [b for b in bets if within_time(b)]
 
-    total_bets = len(rows)
-
+    total_bets = len(bets)
     if total_bets == 0:
         return {
             "filterConflict": False,
@@ -262,38 +263,26 @@ def get_stats(
             "losses": 0,
             "currentNominal": 100,
             "currentBank": 2000,
-            "noResult": 0,
+            "periods": []
         }
 
-    # ---------- 3) wins/losses — СТРОГО по Bet.won после фильтров ----------
-    # Чтобы посчитать по БД (а не по Python-списку), мы повторим те же фильтры на запросе и посчитаем агрегаты:
-    q_filtered = db.query(Bet)
-    if season:
-        q_filtered = q_filtered.filter(Bet.season == season)
-    if eff_start:
-        q_filtered = q_filtered.filter(Bet.date >= eff_start)
-    if eff_end:
-        q_filtered = q_filtered.filter(Bet.date <= eff_end)
-    if bet_type and bet_type != "all":
-        q_filtered = q_filtered.filter(Bet.bet_type.contains(bet_type))
-    if is_premium is not None:
-        q_filtered = q_filtered.filter(Bet.is_premium == is_premium)
-    if tournaments:
-        tlist = [t.strip() for t in tournaments.split(",") if t.strip()]
-        if tlist:
-            q_filtered = q_filtered.filter(Bet.tournament.in_(tlist))
-    # время дня на SQL не накладываем — уже отфильтровали в rows
-    # но для согласованности посчитаем wins/losses на Python-слайсе:
-    wins = sum(1 for b in rows if b.won is True)
-    losses = sum(1 for b in rows if b.won is False)
-    no_result = max(0, total_bets - wins - losses)
-
-    # ---------- 4) остальные метрики — как и раньше через ProfitCalculator ----------
+    # ---------- 3) расчёты новой логикой ----------
     calculator = ProfitCalculator()
-    profit = calculator.calculate_total_profit(rows)
+    profit = calculator.calculate_total_profit(bets)
 
-    win_rate = (wins / total_bets * 100) if total_bets else 0.0
-    roi = (profit["total_profit"] / profit["total_staked"] * 100) if profit["total_staked"] > 0 else 0.0
+    win_rate = (profit["total_wins"] / total_bets * 100) if total_bets > 0 else 0
+    roi = (profit["total_profit"] / profit["total_staked"] * 100) if profit["total_staked"] > 0 else 0
+
+    # не показываем периоды в будущем (только до текущей даты включительно)
+    now = datetime.now()
+    periods = []
+    for p in profit.get("periods", []):
+        try:
+            pend = datetime.strptime(p["end"], "%Y-%m-%d")
+        except Exception:
+            continue
+        if pend <= now:
+            periods.append(p)
 
     return {
         "filterConflict": False,
@@ -303,13 +292,46 @@ def get_stats(
         "totalStaked": round(profit["total_staked"], 2),
         "totalWon": round(profit["total_won"], 2),
         "roi": round(roi, 1),
-        "wins": int(wins),
-        "losses": int(losses),
+        "wins": profit["total_wins"],
+        "losses": profit["total_losses"],
         "currentNominal": profit["current_nominal"],
         "currentBank": profit["current_bank"],
-        "noResult": int(no_result),
+        "periods": periods
     }
 
+@app.get("/api/periods")
+def get_periods(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    bet_type: Optional[str] = None,
+    is_premium: Optional[bool] = None,
+    result: Optional[str] = None,
+    month: Optional[str] = None,
+    season: Optional[str] = None,
+    tournaments: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Только периоды (nominal/bank), с теми же фильтрами, без будущих месяцев."""
+    resp = get_stats(
+        start_date=start_date,
+        end_date=end_date,
+        start_time=start_time,
+        end_time=end_time,
+        bet_type=bet_type,
+        is_premium=is_premium,
+        result=result,
+        month=month,
+        season=season,
+        tournaments=tournaments,
+        db=db
+    )
+    # если фильтры в конфликте — отдадим пустой массив
+    return {
+        "filterConflict": resp.get("filterConflict", False),
+        "periods": resp.get("periods", []) if not resp.get("filterConflict") else []
+    }
 
 
 
