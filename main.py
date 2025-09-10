@@ -142,54 +142,109 @@ def get_bets(
 
 # ===== Stats =====
 @app.get("/api/stats")
+# ===== Stats =====
+@app.get("/api/stats")
 def get_stats(
+    # даты
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    # время в дне
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
+    # фильтры
     bet_type: Optional[str] = None,
     is_premium: Optional[bool] = None,
+    result: Optional[str] = None,           # NEW: WIN / LOSE / all
+    month: Optional[str] = None,            # NEW: YYYY-MM
+    season: Optional[str] = None,           # NEW: сезон
     tournaments: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """Получение статистики с точными расчетами"""
+    """
+    Получение статистики с точными расчётами + корректная фильтрация:
+    - month (YYYY-MM)
+    - season
+    - bet_type (contains, кроме 'all')
+    - is_premium
+    - result: WIN / LOSE (через Bet.won)
+    - tournaments: CSV
+    - start_date/end_date
+    - start_time/end_time (доп. фильтрация по времени, не отключает остальные)
+    """
+    from calendar import monthrange
+
     query = db.query(Bet)
 
-    # Даты
-    if start_date:
+    # --- сезон ---
+    if season:
+        query = query.filter(Bet.season == season)
+
+    # --- месяц YYYY-MM ---
+    if month:
+        try:
+            year_s, month_s = month.split('-')
+            year = int(year_s)
+            month_num = int(month_s)
+            start_of_month = datetime(year, month_num, 1)
+            last_day = monthrange(year, month_num)[1]
+            end_of_month = datetime(year, month_num, last_day, 23, 59, 59)
+            query = query.filter(Bet.date >= start_of_month, Bet.date <= end_of_month)
+        except Exception:
+            pass  # некорректный формат - молча игнорируем
+
+    # --- диапазон дат (если month не задан) ---
+    if start_date and not month:
         query = query.filter(Bet.date >= start_date)
-    if end_date:
+    if end_date and not month:
         end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
         query = query.filter(Bet.date < end_dt)
 
-    # Фильтр по времени
-    if start_time or end_time:
-        bets_list = query.all()
-        filtered_bets = []
-        for bet in bets_list:
-            if bet.date:
-                bet_time = bet.date.time()
-                if start_time:
-                    start_time_obj = datetime.strptime(start_time, "%H:%M").time()
-                    if bet_time < start_time_obj:
-                        continue
-                if end_time:
-                    end_time_obj = datetime.strptime(end_time, "%H:%M").time()
-                    if bet_time > end_time_obj:
-                        continue
-                filtered_bets.append(bet)
-        bets = filtered_bets
-    else:
-        if bet_type:
-            query = query.filter(Bet.bet_type == bet_type)
-        if is_premium is not None:
-            query = query.filter(Bet.is_premium == is_premium)
-        if tournaments:
-            tournament_list = tournaments.split(',')
-            query = query.filter(Bet.tournament.in_(tournament_list))
-        bets = query.all()
+    # --- вид ставки ---
+    if bet_type and bet_type != 'all':
+        # используем contains как в /api/bets
+        query = query.filter(Bet.bet_type.contains(bet_type))
 
-    total_bets = len(bets)
+    # --- премиум ---
+    if is_premium is not None:
+        query = query.filter(Bet.is_premium == is_premium)
+
+    # --- результат ---
+    if result and result != 'all':
+        if result.upper() == 'WIN':
+            query = query.filter(Bet.won == True)
+        elif result.upper() == 'LOSE':
+            query = query.filter(Bet.won == False)
+        # прочее игнорируем
+
+    # --- турниры (CSV) ---
+    if tournaments:
+        tournament_list = [t.strip() for t in tournaments.split(',') if t.strip()]
+        if tournament_list:
+            query = query.filter(Bet.tournament.in_(tournament_list))
+
+    # Получаем предварительный список с учётом всех фильтров выше
+    filtered_bets = query.all()
+
+    # --- ДОП. фильтрация по времени внутри суток ---
+    if start_time or end_time:
+        def within_time(bet):
+            if not bet.date:
+                return False
+            bt = bet.date.time()
+            if start_time:
+                st = datetime.strptime(start_time, "%H:%M").time()
+                if bt < st:
+                    return False
+            if end_time:
+                et = datetime.strptime(end_time, "%H:%M").time()
+                if bt > et:
+                    return False
+            return True
+
+        filtered_bets = [b for b in filtered_bets if within_time(b)]
+
+    # ---- расчёт ----
+    total_bets = len(filtered_bets)
     if total_bets == 0:
         return {
             "totalBets": 0,
@@ -205,7 +260,7 @@ def get_stats(
         }
 
     calculator = ProfitCalculator()
-    profit_data = calculator.calculate_total_profit(bets)
+    profit_data = calculator.calculate_total_profit(filtered_bets)
 
     total_profit = profit_data["total_profit"]
     total_staked = profit_data["total_staked"]
@@ -230,6 +285,7 @@ def get_stats(
         "currentNominal": current_nominal,
         "currentBank": current_bank
     }
+
 
 
 @app.get("/api/stats/periods")
