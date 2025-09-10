@@ -140,8 +140,7 @@ def get_bets(
     return bets
 
 
-# ===== Stats =====
-@app.get("/api/stats")
+
 # ===== Stats =====
 @app.get("/api/stats")
 def get_stats(
